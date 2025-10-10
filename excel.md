@@ -371,3 +371,279 @@ df_sample = df.sample(n=min(100, len(df)))
 
 
 
+非常好 👍
+你问的这个重点非常关键：
+
+> **Excel 大文件 → 分块上传 → 大模型逐块处理并汇总结果**
+> 这正是 ChatGPT/Claude 的 **AI Excel / Code Interpreter** 在后台做的核心机制之一。
+
+下面我给你讲清楚整个系统级实现方案（含逻辑架构 + Java 后端 + 分块上传 + Agent 汇总），一步步剖析👇
+
+---
+
+## 🧩 一、总体设计目标
+
+目标：
+当 Excel 文件过大（如 50MB、几十万行）时：
+
+1. **不能一次性加载进内存**
+2. **不能一次性发给模型（token 超限）**
+3. **又要保证模型能理解全局表格语义**
+
+👉 因此采用 **Chunking（分块） + Streaming（流式处理） + Aggregation（汇总）**。
+
+---
+
+## ⚙️ 二、总体架构示意图
+
+```
+         ┌────────────┐
+         │ Excel 文件  │
+         └──────┬─────┘
+                │
+        (1) Java 读取行流
+                ▼
+         ┌────────────┐
+         │ 分块器 Chunker│
+         └──────┬─────┘
+                │生成
+       {"partIndex":1,"rows":[...]}
+                │
+                ▼
+         ┌──────────────┐
+         │ LLM Worker（GPT/Claude）│
+         └──────┬───────┘
+                │stream
+                ▼
+         ┌────────────┐
+         │ 汇总器 Aggregator│
+         └──────┬─────┘
+                │
+                ▼
+         ┌────────────┐
+         │ 最终分析结果 │
+         └────────────┘
+```
+
+---
+
+## 🧱 三、实现步骤详解
+
+### **1️⃣ Java 分块读取 Excel**
+
+使用 Apache POI 的 *SAX 事件流模式*（低内存）逐行读取：
+
+```java
+int chunkSize = 500; // 每块行数
+int partIndex = 1;
+
+List<List<Object>> currentChunk = new ArrayList<>();
+for (Row row : sheet) {
+    List<Object> rowData = new ArrayList<>();
+    for (Cell cell : row) {
+        rowData.add(getCellValue(cell));
+    }
+    currentChunk.add(rowData);
+
+    if (currentChunk.size() >= chunkSize) {
+        sendChunkToModel(partIndex++, currentChunk);
+        currentChunk.clear();
+    }
+}
+// 最后一块
+if (!currentChunk.isEmpty()) {
+    sendChunkToModel(partIndex++, currentChunk);
+}
+```
+
+👉 每 500 行打包一次，构造成：
+
+```json
+{
+  "sheet": "Sales",
+  "partIndex": 1,
+  "partCount": 10,
+  "headers": ["日期","销售额","地区"],
+  "rows": [
+    ["2025-01-01", 123, "北京"],
+    ...
+  ]
+}
+```
+
+---
+
+### **2️⃣ sendChunkToModel()：分块调用大模型**
+
+可以用 OpenAI / Claude API 的 *流式接口（stream）*：
+
+```java
+JsonNode payload = objectMapper.createObjectNode()
+    .put("partIndex", partIndex)
+    .set("rows", objectMapper.valueToTree(rows));
+
+String response = callModel("analyze_excel_chunk", payload);
+```
+
+示例 prompt：
+
+```
+你是一个 Excel 分析助手。现在收到第 {partIndex}/{partCount} 个数据分块。
+请提取本分块的统计特征（平均值、最大值、异常项）。
+```
+
+模型返回：
+
+```json
+{
+  "chunkIndex": 1,
+  "summary": {
+    "平均销售额": 15230.5,
+    "异常记录": 3
+  }
+}
+```
+
+---
+
+### **3️⃣ 汇总阶段（Aggregator）**
+
+等所有分块处理完成后，服务端将结果合并：
+
+```java
+List<ChunkResult> allResults = collectResults();
+
+double totalMean = allResults.stream()
+    .mapToDouble(r -> r.getSummary().getAvgSales())
+    .average().orElse(0);
+
+int totalAnomalies = allResults.stream()
+    .mapToInt(r -> r.getSummary().getAnomalyCount())
+    .sum();
+```
+
+或者让模型再进行一次汇总推理：
+
+```json
+{
+  "task": "merge_excel_chunk_results",
+  "chunks": [
+    {"平均销售额": 15000, "异常记录": 3},
+    {"平均销售额": 15500, "异常记录": 2}
+  ]
+}
+```
+
+prompt:
+
+```
+请汇总上述分块的统计结果，给出总体平均值与总异常记录数。
+```
+
+---
+
+### **4️⃣ 可选优化：流式上传 + 实时响应**
+
+当文件特别大时，可以边读边发边算：
+
+* 前端 / 后端用 WebSocket 建立 streaming channel；
+* 每个 chunk 传给模型；
+* 模型流式生成结果；
+* 汇总模块实时更新。
+
+Claude / GPT 都支持这样的流式接口。
+
+---
+
+## 🧩 四、示例：完整 JSON 格式
+
+第一个分块：
+
+```json
+{
+  "sheet": "Sales",
+  "partIndex": 1,
+  "partCount": 5,
+  "headers": ["Date", "Region", "Sales"],
+  "rows": [
+    ["2025-01-01", "Beijing", 100],
+    ["2025-01-02", "Shanghai", 200]
+  ]
+}
+```
+
+模型输出：
+
+```json
+{
+  "chunk": 1,
+  "summary": {
+    "avg_sales": 150,
+    "max_sales": 200,
+    "min_sales": 100
+  }
+}
+```
+
+最后再发一次汇总请求：
+
+```json
+{
+  "chunks": [
+    {"avg_sales": 150, "max_sales": 200},
+    {"avg_sales": 300, "max_sales": 500}
+  ]
+}
+```
+
+模型最终输出：
+
+```json
+{
+  "overall_avg_sales": 225,
+  "overall_max_sales": 500
+}
+```
+
+---
+
+## 🧠 五、优点
+
+| 优点         | 说明                           |
+| ---------- | ---------------------------- |
+| ✅ Token 控制 | 每块数据 ≤ 几千 token，安全           |
+| ✅ 并行性强     | 可并行发多个 chunk 请求              |
+| ✅ 内存安全     | 不需一次性加载整表                    |
+| ✅ 模型兼容     | Claude、GPT 都能理解 partIndex 流程 |
+| ✅ 可扩展      | 支持中途暂停/重试/断点续传               |
+
+---
+
+## 💡 六、再往上层：Tool Agent 汇总
+
+在多轮对话模式下（function_call / tool_call），可以定义：
+
+* `process_excel_chunk` 工具：逐块分析；
+* `merge_excel_summary` 工具：聚合结果。
+
+模型可以自动推理执行：
+
+```json
+[
+  {"function": "process_excel_chunk", "arguments": {"partIndex": 1}},
+  {"function": "process_excel_chunk", "arguments": {"partIndex": 2}},
+  {"function": "merge_excel_summary"}
+]
+```
+
+---
+
+如果你希望我帮你写一个：
+
+> ✅ Java + Spring Boot 的 “AI Excel Chunk Processor” 模块（含 POI 读取、分块上传、Claude/GPT 流式处理、聚合逻辑）
+
+我可以帮你生成一个完整可运行的工程骨架（含 REST API + 分块上传逻辑）。
+要我帮你写出来吗？
+
+
+
