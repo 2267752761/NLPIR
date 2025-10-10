@@ -136,3 +136,238 @@ GPT-5 的执行层（Claude 和 ChatGPT 类似）并非直接跑 Python，而是
 
 是否希望我帮你写出一个完整的 **Java + Spring Boot 实现 AI Excel 的代码骨架（含 Python 执行与前端交互）**？
 我可以帮你从接口、模型、执行层一步一步搭起来。
+
+
+
+
+非常好的、非常实际的问题 👍
+——你已经触及到 **AI Excel 系统的性能核心点**：
+
+> 大 Excel 转 JSON 时，**空值太多 + 冗余结构** → 导致 **token 爆炸**（GPT/Claude 处理超慢、超贵）。
+
+我们来系统性地讲讲怎么优化：
+
+---
+
+## 🧩 一、问题的本质
+
+原始 JSON：
+
+```json
+{
+  "headers": ["A", "B", "C", "D"],
+  "rows": [
+    ["2025-01-01", 100, null, null],
+    ["2025-02-01", null, null, null],
+    ["2025-03-01", 200, 10, null]
+  ]
+}
+```
+
+👉 在大文件中（如 10 万行 × 20 列），
+这些 `null` 值会浪费 **数十万个 token**。
+
+而模型根本不关心这些空字段。
+
+---
+
+## ⚙️ 二、总体优化思路
+
+| 优化目标     | 解决策略                  |
+| -------- | --------------------- |
+| 减少 token | 删除空列、空行、空单元格          |
+| 压缩结构     | 使用稀疏编码（Sparse Format） |
+| 智能抽样     | 只传“代表性数据子集”           |
+| 延迟加载     | 按需分析时再加载部分表           |
+
+---
+
+## ✅ 三、实用级优化方案（建议分层执行）
+
+### **1️⃣ 删除空行、空列**
+
+用 POI / pandas 判断整行、整列是否全为空：
+
+```python
+df = df.dropna(axis=0, how='all')  # 删除空行
+df = df.dropna(axis=1, how='all')  # 删除空列
+```
+
+Java 版本（Apache POI）类似：
+
+```java
+boolean isRowEmpty = row == null || IntStream.range(0, lastCellNum)
+    .allMatch(i -> StringUtils.isBlank(getCellString(row.getCell(i))));
+```
+
+---
+
+### **2️⃣ 转换为稀疏格式（Sparse JSON）**
+
+传统 JSON 占用太大，可以改为仅记录 **非空单元格坐标**：
+
+```json
+{
+  "headers": ["A", "B", "C", "D"],
+  "rows": [
+    { "row": 0, "values": { "A": "2025-01-01", "B": 100 } },
+    { "row": 2, "values": { "A": "2025-03-01", "B": 200, "C": 10 } }
+  ]
+}
+```
+
+⚙️ 模型照样能理解，但 token 占用减少 **80% 以上**。
+
+---
+
+### **3️⃣ 数据抽样（Sampling）**
+
+如果文件过大（> 1MB），只取部分代表性数据。
+
+可用 pandas：
+
+```python
+df_sample = df.sample(n=100, random_state=42)
+```
+
+或者智能抽样：
+
+* 优先保留首行、尾行；
+* 对时间序列按时间间隔取样；
+* 保留异常值样本（方便模型分析）。
+
+---
+
+### **4️⃣ 数值压缩（Normalization）**
+
+数字型数据（如 12345.67）可压缩为 **相对比例或区间**：
+
+```json
+{
+  "sales": {
+    "min": 1000,
+    "max": 20000,
+    "mean": 10450
+  }
+}
+```
+
+这样 LLM 仍能推断趋势，但 token 几乎不占。
+
+---
+
+### **5️⃣ 延迟加载（Chunking / Streaming）**
+
+针对大文件（>10MB），可以将数据拆分为分块上传给模型：
+
+```json
+{
+  "sheet": "Sales",
+  "partIndex": 1,
+  "partCount": 5,
+  "headers": [...],
+  "rows": [...]
+}
+```
+
+模型逐块处理（可通过 Tool Agent 机制汇总结果）。
+
+---
+
+### **6️⃣ 元数据优先 + 数据摘要**
+
+有时模型不需要完整数据，只要结构和描述即可：
+
+```json
+{
+  "columns": [
+    {"name": "日期", "type": "date"},
+    {"name": "销售额", "type": "number", "mean": 10234, "std": 1223},
+    {"name": "地区", "type": "string", "unique_count": 12}
+  ],
+  "sample_rows": [
+    ["2025-01-01", 12000, "北京"],
+    ["2025-01-02", 13500, "上海"]
+  ]
+}
+```
+
+👉 这种结构非常节省 token，又能让模型理解表结构。
+
+---
+
+## 📦 四、推荐的混合 JSON 结构（综合优化版）
+
+适合发给大模型的最终结构：
+
+```json
+{
+  "sheetName": "销售数据",
+  "meta": {
+    "rowCount": 10500,
+    "colCount": 8,
+    "nullRate": 0.36
+  },
+  "columns": [
+    {"name": "日期", "type": "date"},
+    {"name": "地区", "type": "string"},
+    {"name": "销售额", "type": "number", "mean": 14200, "std": 4300}
+  ],
+  "sample": [
+    ["2025-01-01", "北京", 12000],
+    ["2025-02-01", "上海", 15000]
+  ]
+}
+```
+
+✅ 优点：
+
+* token 大幅减少；
+* 模型可理解字段类型；
+* 保留代表性样本；
+* 扩展性强，可再增字段统计。
+
+---
+
+## 🚀 五、推荐策略总结
+
+| 优化方向   | 方法      | 预期效果       |
+| ------ | ------- | ---------- |
+| 删除空数据  | dropna  | 20%~40% 减少 |
+| 稀疏JSON | 仅存非空单元格 | 60%~80% 减少 |
+| 抽样     | 只取代表性数据 | 90% 减少     |
+| 统计摘要   | 替代全量值   | 95% 减少     |
+
+---
+
+## 💡 六、附：Java + Python 混合实现思路
+
+Java（Apache POI）读取 Excel 后：
+
+```java
+List<List<Object>> rows = ... // 读取有效数据
+rows = rows.stream()
+           .filter(row -> row.stream().anyMatch(Objects::nonNull))
+           .collect(Collectors.toList());
+```
+
+再调用 Python：
+
+```python
+# 在 Python 侧进行抽样与压缩
+df = pd.DataFrame(rows, columns=headers)
+df = df.dropna(how='all', axis=0)
+df_sample = df.sample(n=min(100, len(df)))
+```
+
+---
+
+如果你希望我帮你输出一个：
+
+> ✅ “AI Excel大模型输入优化器（Java版 + Python抽样逻辑）”的完整实现模板（含JSON结构定义与压缩算法）
+
+我可以帮你写出可直接在项目中集成的版本。
+是否需要？
+
+
+
