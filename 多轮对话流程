@@ -1,0 +1,892 @@
+---
+  一、整体架构设计
+
+  1.1 核心入口与路由机制
+
+  主入口方法：executeMultiRoundOperation (ExcelAIService.java:85-147)
+
+  请求流 → 意图识别 → 路由到三种执行模式之一 → 返回响应
+
+  三种执行模式：
+  if (!intentionResult.isExcelOperation()) {
+      // 模式1：对话响应模式 - 非Excel操作
+      handleConversationalFlow()
+  } else if (continueMultiRound != null && continueMultiRound) {
+      // 模式2：继续执行模式 - 多轮对话的后续轮次
+      handleContinueMultiRound()
+  } else {
+      // 模式3：首轮规划模式 - 生成执行计划
+      handleFirstRoundPlanning()
+  }
+
+  1.2 请求参数结构
+
+  executeMultiRoundOperation(
+      String operation,                         // 用户操作请求
+      Map<String, Object> context,              // 表格上下文（包含Excel数据、channelId等）
+      Boolean continueMultiRound,               // 是否为继续执行模式
+      Integer previousRounds,                   // 已完成轮数
+      List<Map<String, Object>> previousStepsHistory,  // 历史步骤记录
+      FlowableEmitter<ServerSentEvent<String>> emitter, // SSE事件流
+      Object thinkingParams,                    // AI思考流配置
+      String messageId,                         // 消息ID
+      String channelId,                         // 频道ID
+      String uid                                // 用户ID
+  )
+
+  ---
+  二、三种执行模式深度解析
+
+  2.1 模式1：对话响应模式 (handleConversationalFlow)
+
+  触发条件：intentionResult.isExcelOperation() == false
+
+  适用场景：
+  - 用户问候："Hello"
+  - 通用问题："What can you do?"
+  - 非Excel操作请求
+
+  执行流程：
+  1. 识别为对话意图
+  2. 直接返回AI对话响应
+  3. 设置 completed=true, continueNeeded=false
+  4. 不生成执行计划
+
+  关键代码 (推测，未在提供的片段中)：
+  response = handleConversationalFlow(
+      intentionResult, operation, channelId,
+      language, emitter, messageId, baseEventList
+  )
+
+  ---
+  2.2 模式2：首轮规划模式 (handleFirstRoundPlanning)
+
+  触发条件：isExcelOperation() == true && continueMultiRound != true
+
+  核心职责：生成执行计划，但不执行操作
+
+  执行流程 (ExcelAIService.java:998-1078)：
+
+  1. 调用 executeExcelOperationWithEmitter 生成执行计划
+     ├─ 格式化Excel数据上下文
+     ├─ 构建系统提示词 + 用户请求
+     └─ 调用AI模型生成ExecutionPlan JSON
+
+  2. 解析AI返回的ExecutionPlan
+     ├─ 检查error字段
+     ├─ 检查isConversational（对话响应）
+     └─ 检查executionPlan是否为空
+
+  3. 返回响应结构
+     ExcelResponse {
+         success: true,
+         executionPlan: [步骤列表],
+         multiRoundResult: {
+             continueNeeded: true,    // ⚠️ 关键：表示需要后续执行
+             completed: false,
+             requiresUpdatedData: false,
+             dataScope: "range|sheet|workbook"
+         },
+         requestId: UUID,
+         isContinuation: false,
+         totalRounds: 1
+     }
+
+  关键设计决策：
+  - 只检查执行计划存在性，不检查 completed 或 needInfo 标志
+  - 空执行计划不视为错误，而是返回 success=true, completed=true, continueNeeded=false
+  - 生成 requestId 用于后续的回滚操作
+
+  代码片段：
+  // 第一轮唯一判断：检查是否有有效的执行计划
+  List<ExecutionPlan.ExecutionStep> executionPlan = parsedResult.getExecutionPlan();
+  if (executionPlan == null || executionPlan.isEmpty()) {
+      return ExcelResponse.builder()
+          .success(true)  // 注意：不是错误
+          .message(responseMessage)
+          .executionPlan(List.of())
+          .multiRoundResult(MultiRoundResult.builder()
+              .completed(true)
+              .continueNeeded(false)
+              .build())
+          .build();
+  }
+
+  ---
+  2.3 模式3：继续执行模式 (handleContinueMultiRound)
+
+  触发条件：isExcelOperation() == true && continueMultiRound == true
+
+  核心职责：根据历史上下文继续执行下一批次操作
+
+  执行流程 (ExcelAIService.java:1083-1282)：
+
+  1. 构建包含历史的上下文
+     continueContext = {
+         ...originalContext,
+         continue_multi_round: true,
+         previous_rounds: n,
+         previous_steps_history: [历史步骤]
+     }
+
+  2. 生成历史增强的操作描述
+     operationWithHistory = buildOperationWithHistory(
+         originalOperation,
+         previousStepsHistory,
+         previousRounds
+     )
+     // 格式：
+     // "Based on the COMPLETE current state, determine what
+     //  additional operations are needed to fulfill the
+     //  original request \"用户请求\".\n\n
+     //  PREVIOUS PROGRESS:\n
+     //  Round 1 Step 1: create_chart\n
+     //  Round 2 Step 1: format_data\n"
+
+  3. 调用AI生成新的执行计划
+
+  4. 按优先级判断执行策略
+     Priority 1: AI明确返回 completed=true
+        └─ 返回 completed=true, continueNeeded=false
+
+     Priority 2: AI返回 needInfo=true
+        └─ 返回 needInfo=true, continueNeeded=false
+
+     Priority 3: 无有效执行计划
+        └─ 返回 completed=true, continueNeeded=false
+
+     Priority 4: 特殊操作完成判断（图表生成）
+        └─ hasChartOperation → 执行后返回 completed=true
+
+     默认情况：执行批次操作
+
+  5. 执行批次步骤
+     executeBatchSteps(executionPlan, continueContext)
+
+  6. 构建执行结果
+     MultiRoundResult {
+         executedBatches: [
+             {
+                 batchId: n+1,
+                 steps: [
+                     { description, function, parameters, status: "completed|failed" }
+                 ]
+             }
+         ],
+         completed: 根据业务逻辑判断,
+         continueNeeded: !completed,
+         requiresUpdatedData: true,
+         dataScope: "range|sheet|chart"
+     }
+
+  优先级判断逻辑详解：
+
+  // Priority 1: AI明确表示完成
+  if (parsedResult.getCompleted() != null && parsedResult.getCompleted()) {
+      return ExcelResponse.builder()
+          .multiRoundResult(MultiRoundResult.builder()
+              .completed(true)
+              .continueNeeded(false)
+              .build())
+          .build();
+  }
+
+  // Priority 2: 需要更多信息
+  if (parsedResult.getNeedInfo() != null && parsedResult.getNeedInfo()) {
+      return ExcelResponse.builder()
+          .needInfo(true)
+          .multiRoundResult(MultiRoundResult.builder()
+              .continueNeeded(false)
+              .completed(false)
+              .build())
+          .build();
+  }
+
+  // Priority 3: 无有效执行计划
+  if (executionPlan == null || executionPlan.isEmpty()) {
+      return ExcelResponse.builder()
+          .multiRoundResult(MultiRoundResult.builder()
+              .completed(true)
+              .continueNeeded(false)
+              .build())
+          .build();
+  }
+
+  // Priority 4: 图表操作特殊处理
+  boolean hasChartOperation = executionPlan.stream()
+      .anyMatch(step -> step.getFunction().contains("chart"));
+  if (hasChartOperation) {
+      // 执行后直接标记完成
+      return completed=true, continueNeeded=false
+  }
+
+  失败处理机制：
+  // 检查执行结果
+  List<Map<String, Object>> successfulSteps = ...
+  List<Map<String, Object>> failedSteps = ...
+
+  if (!failedSteps.isEmpty()) {
+      return ExcelResponse.builder()
+          .success(false)
+          .error(String.format("执行失败: %d steps failed", failedSteps.size()))
+          .multiRoundResult(MultiRoundResult.builder()
+              .completed(false)
+              .continueNeeded(false)  // ⚠️ 失败后不继续
+              .requiresUpdatedData(!successfulSteps.isEmpty())
+              .executedBatches(successfulSteps.isEmpty() ? List.of() : List.of(executedBatch))
+              .build())
+          .build();
+  }
+
+  ---
+  三、状态管理机制
+
+  3.1 核心数据模型
+
+  ExecutionPlan - 执行计划模型
+
+  @Data
+  public class ExecutionPlan {
+      @JsonProperty("execution_plan")
+      private List<ExecutionStep> executionPlan;  // AI生成的步骤列表
+
+      private String error;                       // 错误信息
+      private Boolean completed;                  // AI判断的完成状态
+      private Boolean needInfo;                   // 是否需要更多信息
+      private String message;                     // 响应消息
+      private Boolean isConversational;          // 是否为对话响应
+
+      // BI Agent相关
+      private List<Map<String, Object>> executedBatches;
+      private Integer totalRounds;
+      private String response;
+
+      public static class ExecutionStep {
+          private Integer step;                   // 步骤序号
+          private String function;                // 函数名（如 create_chart）
+          private Map<String, Object> parameters; // 参数对象
+          private String description;             // 步骤描述
+      }
+  }
+
+  MultiRoundResult - 多轮执行结果模型
+
+  @Data
+  public class MultiRoundResult {
+      @JsonProperty("continue_needed")
+      private Boolean continueNeeded;      // ⭐ 关键：前端据此决定是否继续
+
+      private Boolean completed;           // 任务是否完全完成
+
+      @JsonProperty("requires_updated_data")
+      private Boolean requiresUpdatedData; // ⭐ 前端据此决定是否刷新Excel数据
+
+      @JsonProperty("data_scope")
+      private String dataScope;            // 数据更新范围：range|sheet|workbook|chart
+
+      @JsonProperty("executed_batches")
+      private List<ExecutedBatch> executedBatches;  // 已执行的批次历史
+
+      private String error;                // 错误信息
+
+      public static class ExecutedBatch {
+          @JsonProperty("batch_id")
+          private Integer batchId;         // 批次ID（对应轮次）
+
+          private List<ExecutedStep> steps; // 该批次的步骤列表
+      }
+
+      public static class ExecutedStep {
+          private String description;      // 步骤描述
+          private String function;         // 函数名
+          private Object parameters;       // 参数
+          private String status;           // completed | failed
+      }
+  }
+
+  3.2 状态转换图
+
+  [开始]
+     ↓
+  [意图识别]
+     ├─ 对话意图 → [返回对话响应] → [completed=true, continueNeeded=false] → [结束]
+     │
+     ├─ Excel操作意图 + 首次请求
+     │   ↓
+     │  [生成执行计划]
+     │   ├─ 空计划 → [completed=true, continueNeeded=false] → [结束]
+     │   └─ 有效计划 → [返回计划] → [completed=false, continueNeeded=true]
+     │                                     ↓
+     │                              [等待前端继续请求]
+     │
+     └─ Excel操作意图 + continueMultiRound=true
+         ↓
+        [构建历史上下文]
+         ↓
+        [生成新执行计划]
+         ↓
+        [优先级判断]
+         ├─ completed=true → [结束]
+         ├─ needInfo=true → [等待用户输入]
+         ├─ 空计划 → [结束]
+         ├─ 图表操作 → [执行] → [completed=true] → [结束]
+         └─ 默认 → [执行批次]
+                     ├─ 全部成功 → [继续或完成]
+                     └─ 部分/全部失败 → [completed=false, continueNeeded=false] → [结束]
+
+  3.3 前后端状态同步机制
+
+  前端判断逻辑（推测基于响应结构）：
+  function handleExcelResponse(response) {
+      if (!response.success) {
+          // 显示错误，不继续
+          showError(response.error)
+          return
+      }
+
+      if (response.multiRoundResult.requiresUpdatedData) {
+          // 根据dataScope刷新Excel数据
+          refreshExcelData(response.multiRoundResult.dataScope)
+      }
+
+      if (response.multiRoundResult.continueNeeded) {
+          // 构建继续请求
+          const continueRequest = {
+              operation: originalOperation,
+              context: getUpdatedContext(),  // 包含最新Excel数据
+              continueMultiRound: true,
+              previousRounds: response.totalRounds,
+              previousStepsHistory: buildHistoryFromBatches(
+                  response.multiRoundResult.executedBatches
+              )
+          }
+          // 发送继续请求
+          sendRequest(continueRequest)
+      } else {
+          // 任务完成或中止
+          if (response.multiRoundResult.completed) {
+              showSuccess(response.message)
+          } else if (response.needInfo) {
+              showInputPrompt(response.message)
+          } else {
+              showWarning("Task stopped")
+          }
+      }
+  }
+
+  ---
+  四、数据流与上下文传播
+
+  4.1 Context数据结构
+
+  context = {
+      // Excel数据
+      "spreadsheet_data": {
+          "sheets": [
+              {
+                  "name": "Sheet1",
+                  "data": [[row1], [row2], ...],
+                  "range": "A1:Z100"
+              }
+          ]
+      },
+
+      // 元数据
+      "channelId": "uuid",
+      "language": "en",
+
+      // 多轮执行特有（仅在continueMultiRound模式）
+      "continue_multi_round": true,
+      "previous_rounds": 2,
+      "previous_steps_history": [
+          {
+              "round": 1,
+              "step": 1,
+              "function": "create_chart",
+              "parameters": {...}
+          },
+          {
+              "round": 2,
+              "step": 1,
+              "function": "format_data",
+              "parameters": {...}
+          }
+      ]
+  }
+
+  4.2 历史上下文构建
+
+  buildOperationWithHistory方法 (ExcelAIService.java:1354-1372)：
+
+  private String buildOperationWithHistory(
+      String originalOperation,
+      List<Map<String, Object>> previousStepsHistory,
+      Integer previousRounds
+  ) {
+      if (previousStepsHistory == null || previousStepsHistory.isEmpty()) {
+          return originalOperation;
+      }
+
+      StringBuilder historyContext = new StringBuilder();
+      historyContext.append("Based on the COMPLETE current state, ")
+                    .append("determine what additional operations are needed ")
+                    .append("to fulfill the original request \"")
+                    .append(originalOperation).append("\".\n\n");
+
+      historyContext.append("PREVIOUS PROGRESS:\n");
+      for (Map<String, Object> step : previousStepsHistory) {
+          historyContext.append(String.format("Round %s Step %s: %s\n",
+                  step.get("round"),
+                  step.get("step"),
+                  step.get("function")));
+      }
+      historyContext.append("\n");
+
+      return historyContext.toString();
+  }
+
+  生成的提示词示例：
+  Based on the COMPLETE current state, determine what additional operations
+  are needed to fulfill the original request "Create a sales chart and format
+  the data".
+
+  PREVIOUS PROGRESS:
+  Round 1 Step 1: create_chart
+  Round 1 Step 2: set_chart_title
+
+  User request: Create a sales chart and format the data
+
+  Spreadsheet data: {...}
+
+  4.3 数据同步流程
+
+  第1轮：首轮规划
+     ↓
+  [前端] 获取执行计划 → 等待用户确认 → 发送continueMultiRound=true
+     ↓
+  第2轮：执行第一批次
+     ├─ [后端] 执行步骤 → 修改Excel数据
+     └─ [后端] 返回 requiresUpdatedData=true, dataScope="sheet"
+     ↓
+  [前端] 刷新Sheet数据 → 构建新context（包含更新后的数据）→ 发送第3轮请求
+     ↓
+  第3轮：基于最新数据继续执行
+     ├─ [后端] 接收最新Excel数据
+     ├─ [后端] AI基于最新状态生成下一批次计划
+     └─ [后端] 执行并返回结果
+     ↓
+  ... 循环直到 continueNeeded=false
+
+  ---
+  五、SSE事件流机制
+
+  5.1 事件类型
+
+  核心事件序列：
+  1. START事件 → "Excel AI任务开始"
+  2. NODE_START事件 → "excel节点开始"
+  3. PROCESSING事件 → "分析中..."
+  4. MESSAGE_THINK事件（流式）→ AI思考过程片段
+  5. RESULT事件 → 执行结果JSON
+  6. NODE_END事件 → "excel节点完成"
+  7. COMPLETE事件 → "任务完成"
+
+  5.2 Thinking事件流机制
+
+  WorkflowChunk订阅者 (ExcelAIService.java:909-949)：
+
+  DefaultSubscriber<WorkflowChunk> subscriber = new DefaultSubscriber<WorkflowChunk>() {
+      @Override
+      public void onNext(WorkflowChunk chunk) {
+          if (chunk.getEvent() == WorkflowEvent.MESSAGE_THINK) {
+              if (!chunk.isSubFlow()) {
+                  // 思考片段 → 发送到前端SSE流
+                  log.info("识别到thinking片段事件，仅发送到SSE流");
+                  sendThinkingEvent(sseEmitter, "AI Thinking", chunk.getContent(),
+  "excel-multi-round");
+              } else {
+                  // 思考汇总 → 保存到数据库，不发送到前端
+                  log.info("识别到thinking汇总事件，仅收集到agentEvents");
+                  BaseEvent thinkingEvent = EventConstants.mockEvent(
+                      "excel-multi-round",
+                      WorkflowEvent.MESSAGE_THINK,
+                      "thinking",
+                      "AI Thinking Summary",
+                      chunk.getContent()
+                  );
+                  baseEventList.add(thinkingEvent);
+              }
+          }
+      }
+  };
+
+  关键设计：
+  - thinking片段 (isSubFlow=false)：流式发送到前端，实时显示AI思考过程
+  - thinking汇总 (isSubFlow=true)：保存到数据库，不发送到前端（避免重复）
+
+  5.3 事件持久化
+
+  数据库保存 (ExcelAIService.java:134)：
+  // 保存所有收集的事件到数据库
+  saveEventsToDatabase(messageId, uid, baseEventList, response);
+
+  baseEventList内容：
+  [
+      { event: NODE_START, tool: "excel", action: "Excel AI任务开始" },
+      { event: PROCESSING, tool: "excel", action: "分析Excel操作请求..." },
+      { event: MESSAGE_THINK, tool: "thinking", param: "AI思考汇总内容" },
+      { event: RESULT, tool: "excel", param: "{execution_plan: [...]}" },
+      { event: NODE_END, tool: "excel", action: "Excel AI任务完成" }
+  ]
+
+  ---
+  六、错误处理与恢复机制
+
+  6.1 错误类型
+
+  1. AI服务调用失败
+  catch (Exception e) {
+      return createErrorResponse(errorMessages.get("service_failed") + ": " + e.getMessage());
+  }
+  2. JSON解析失败
+  try {
+      ExecutionPlan parsed = objectMapper.readValue(cleanedResult, ExecutionPlan.class);
+  } catch (Exception e) {
+      // 尝试更激进的清理
+      String extractedJson = extractJsonFromString(result);
+      // 二次解析尝试
+  }
+  3. 步骤执行失败
+  List<Map<String, Object>> failedSteps = batchResults.stream()
+      .filter(r -> !Boolean.TRUE.equals(r.get("success")))
+      .toList();
+
+  if (!failedSteps.isEmpty()) {
+      return ExcelResponse.builder()
+          .success(false)
+          .error("执行失败: " + failedSteps.size() + " steps failed")
+          .multiRoundResult(MultiRoundResult.builder()
+              .continueNeeded(false)  // 失败后不继续
+              .build())
+          .build();
+  }
+
+  6.2 回滚机制
+
+  requestId生成 (ExcelAIService.java:1006)：
+  String requestId = java.util.UUID.randomUUID().toString();
+
+  用途（推测）：
+  - 前端保存每轮的 requestId
+  - 当用户点击"撤销"时，发送 requestId 到后端
+  - 后端根据 requestId 回滚对应轮次的操作
+
+  6.3 异常事件记录
+
+  catch (Exception e) {
+      log.error("Excel多轮操作执行失败", e);
+
+      // 发送异常NODE_END事件
+      sendAndCollectNodeEvent(emitter, messageId, baseEventList,
+          WorkflowEvent.NODE_END, "excel", getTaskErrorMessage(language), e.getMessage());
+
+      // 保存异常信息到数据库
+      saveEventsToDatabase(messageId, uid, baseEventList, null, e);
+
+      throw e;
+  }
+
+  ---
+  七、关键设计决策与权衡
+
+  7.1 为什么首轮不执行操作？
+
+  设计决策：首轮只生成执行计划，等待前端确认后再执行
+
+  理由：
+  1. 用户确认：给用户审查计划的机会
+  2. 安全性：避免自动执行破坏性操作（删除数据等）
+  3. 透明性：用户清楚知道AI将执行什么操作
+  4. 可中止：用户可以在执行前取消
+
+  交互流程：
+  用户："Create a sales chart"
+    ↓
+  [系统] 生成执行计划：
+    Step 1: create_chart(type="bar", data_range="A1:B10")
+    Step 2: set_chart_title(title="Sales Analysis")
+    ↓
+  [前端] 显示计划，询问："是否执行此计划？"
+    ├─ 用户点击"执行" → 发送 continueMultiRound=true
+    └─ 用户点击"取消" → 任务结束
+
+  7.2 为什么使用优先级判断？
+
+  handleContinueMultiRound中的优先级 (ExcelAIService.java:1113-1199)：
+
+  Priority 1: completed=true     → 立即返回，任务完成
+  Priority 2: needInfo=true      → 等待用户输入
+  Priority 3: 空执行计划         → 没有更多操作，任务完成
+  Priority 4: 图表操作           → 执行后标记完成
+  Priority 5: 默认               → 执行批次，继续多轮对话
+
+  理由：
+  - AI意图优先：优先尊重AI的明确判断（completed、needInfo）
+  - 特殊操作识别：图表生成通常是最终步骤，完成后无需继续
+  - 灵活性：支持AI动态决定是否需要继续
+
+  7.3 为什么区分thinking片段和汇总？
+
+  设计：
+  - 片段 (isSubFlow=false)：发送到前端实时展示
+  - 汇总 (isSubFlow=true)：保存到数据库但不发送前端
+
+  理由：
+  1. 用户体验：实时显示思考过程，增加透明度和信任感
+  2. 避免重复：汇总内容已在片段中展示，不重复发送
+  3. 历史记录：汇总内容完整保存到数据库，便于回溯分析
+  4. 性能：减少前端SSE数据量
+
+  7.4 数据范围判断 (dataScope)
+
+  determineOperationScope方法 (ExcelAIService.java:1377-1394)：
+
+  private String determineOperationScope(List<ExecutionPlan.ExecutionStep> executionPlan) {
+      boolean hasDataModification = executionPlan.stream()
+          .anyMatch(step -> step.getFunction().contains("set") ||
+                           step.getFunction().contains("insert") ||
+                           step.getFunction().contains("delete"));
+
+      boolean hasChart = executionPlan.stream()
+          .anyMatch(step -> step.getFunction().contains("chart"));
+
+      if (hasChart) return "chart";
+      if (hasDataModification) return "data_modification";
+      return "analysis";
+  }
+
+  前端根据dataScope决定刷新策略：
+  - "chart" → 只刷新图表区域
+  - "data_modification" → 刷新整个工作表
+  - "analysis" → 不刷新数据（只读操作）
+
+  ---
+  八、完整执行示例
+
+  示例场景：用户请求 "Create a sales chart and highlight top 3 products"
+
+  第1轮：首轮规划
+  [前端] → [后端]
+  {
+      operation: "Create a sales chart and highlight top 3 products",
+      context: { spreadsheet_data: {...}, language: "en" },
+      continueMultiRound: null
+  }
+
+  [后端] executeMultiRoundOperation
+    ↓ 意图识别 → Excel操作
+    ↓ handleFirstRoundPlanning
+    ↓ AI生成执行计划
+
+  [后端] → [前端]
+  {
+      success: true,
+      executionPlan: [
+          { step: 1, function: "identify_top_products", parameters: {...}, description: "Find
+  top 3 products" },
+          { step: 2, function: "create_bar_chart", parameters: {...}, description: "Create
+  sales chart" },
+          { step: 3, function: "highlight_cells", parameters: {...}, description: "Highlight
+  top 3" }
+      ],
+      multiRoundResult: {
+          continueNeeded: true,
+          completed: false,
+          requiresUpdatedData: false
+      },
+      requestId: "uuid-123",
+      totalRounds: 1
+  }
+
+  第2轮：执行第一批次
+  [前端] → [后端]
+  {
+      operation: "Create a sales chart and highlight top 3 products",
+      context: { spreadsheet_data: {...} },  // 最新数据
+      continueMultiRound: true,
+      previousRounds: 1,
+      previousStepsHistory: []
+  }
+
+  [后端] handleContinueMultiRound
+    ↓ buildOperationWithHistory
+    ↓ AI生成新执行计划（基于当前状态）
+    ↓ executeBatchSteps → 执行步骤1、2、3
+    ↓ 检查：hasChartOperation=true → 标记完成
+
+  [后端] → [前端]
+  {
+      success: true,
+      multiRoundResult: {
+          completed: true,
+          continueNeeded: false,
+          requiresUpdatedData: true,
+          dataScope: "chart",
+          executedBatches: [
+              {
+                  batchId: 2,
+                  steps: [
+                      { description: "Find top 3 products", function: "identify_top_products",
+   status: "completed" },
+                      { description: "Create sales chart", function: "create_bar_chart",
+  status: "completed" },
+                      { description: "Highlight top 3", function: "highlight_cells", status:
+  "completed" }
+                  ]
+              }
+          ]
+      },
+      message: "Round 2 completed with chart generation. Task finished.",
+      totalRounds: 2
+  }
+
+  前端处理：
+  // 收到响应
+  if (response.multiRoundResult.requiresUpdatedData) {
+      refreshExcelData("chart");  // 刷新图表区域
+  }
+  if (response.multiRoundResult.completed) {
+      showSuccess("任务完成！已创建销售图表并高亮前3产品");
+  }
+  // continueNeeded=false，不继续请求
+
+  ---
+
+⏺ 九、核心要点总结
+
+  9.1 架构关键点
+
+  | 维度   | 设计                              | 目的            |
+  |------|---------------------------------|---------------|
+  | 执行模式 | 三种模式（对话/首轮/继续）                  | 根据请求类型灵活路由    |
+  | 状态管理 | MultiRoundResult数据模型            | 前后端状态同步       |
+  | 历史传播 | buildOperationWithHistory       | AI基于历史做增量决策   |
+  | 数据同步 | requiresUpdatedData + dataScope | 按需精准刷新Excel数据 |
+  | 用户控制 | 首轮不执行 + requestId               | 可审查、可回滚       |
+
+  9.2 多轮对话状态机
+
+  Initial State: 用户发起请求
+      ↓
+  [意图识别]
+      ├─ 对话意图 → [One-shot完成] → TERMINAL STATE
+      │
+      ├─ Excel操作 + 首次 → [生成计划] → WAITING STATE
+      │                                      ↓
+      │                           用户确认或修改计划
+      │                                      ↓
+      └─ Excel操作 + Continue → [执行批次] → EVALUATION STATE
+                                               ├─ completed=true → TERMINAL STATE
+                                               ├─ needInfo=true → PAUSED STATE → 等待用户输入
+                                               ├─ 失败 → TERMINAL STATE
+                                               └─ 继续 → WAITING STATE（循环）
+
+  9.3 前后端交互协议
+
+  请求参数约定：
+  interface ExcelAIRequest {
+      operation: string;           // 用户操作描述
+      context: {
+          spreadsheet_data: object;  // Excel数据
+          channelId: string;
+          language: string;
+      };
+      continueMultiRound?: boolean;  // 是否继续执行
+      previousRounds?: number;       // 已完成轮数
+      previousStepsHistory?: Array<{  // 历史步骤
+          round: number;
+          step: number;
+          function: string;
+          parameters: object;
+      }>;
+  }
+
+  响应结构约定：
+  interface ExcelAIResponse {
+      success: boolean;
+      error?: string;
+      message?: string;
+      needInfo?: boolean;           // 需要更多信息
+      executionPlan?: ExecutionStep[];  // 第一轮返回
+      requestId?: string;           // 回滚ID
+      totalRounds: number;
+      isContinuation: boolean;
+      multiRoundResult: {
+          continueNeeded: boolean;      // ⭐ 前端据此判断是否继续
+          completed: boolean;
+          requiresUpdatedData: boolean;  // ⭐ 前端据此判断是否刷新
+          dataScope: string;            // 刷新范围
+          executedBatches?: ExecutedBatch[];
+      };
+  }
+
+  9.4 关键代码位置索引
+
+  | 功能        | 文件                    | 行号        | 描述                               |
+  |-----------|-----------------------|-----------|----------------------------------|
+  | 多轮协调入口    | ExcelAIService.java   | 85-147    | executeMultiRoundOperation       |
+  | 首轮规划      | ExcelAIService.java   | 998-1078  | handleFirstRoundPlanning         |
+  | 继续执行      | ExcelAIService.java   | 1083-1282 | handleContinueMultiRound         |
+  | 历史构建      | ExcelAIService.java   | 1354-1372 | buildOperationWithHistory        |
+  | AI调用      | ExcelAIService.java   | 157-228   | executeExcelOperationWithEmitter |
+  | 数据模型      | ExecutionPlan.java    | 1-51      | 执行计划模型
+   |
+  | 结果模型      | MultiRoundResult.java | 1-62      | 多轮结果模型
+   |
+  | Thinking流 | ExcelAIService.java   | 909-949   | WorkflowChunk订阅                  |
+
+  ---
+  十、优化建议
+
+  基于深入分析，提出以下优化建议：
+
+  10.1 超时保护
+
+  当前问题：多轮对话可能无限循环
+  建议：
+  private static final int MAX_ROUNDS = 10;  // 最大轮数限制
+
+  if (previousRounds >= MAX_ROUNDS) {
+      return ExcelResponse.builder()
+          .success(false)
+          .error("超过最大轮数限制（10轮），任务终止")
+          .multiRoundResult(MultiRoundResult.builder()
+              .continueNeeded(false)
+              .completed(false)
+              .build())
+          .build();
+  }
+
+  10.2 历史压缩
+
+  当前问题：历史步骤可能过多，导致提示词过长
+  建议：
+  // 只保留最近N轮的历史
+  private static final int MAX_HISTORY_ROUNDS = 3;
+  List<Map<String, Object>> recentHistory = previousStepsHistory.stream()
+      .filter(step -> (int)step.get("round") > previousRounds - MAX_HISTORY_ROUNDS)
+      .toList();
+
+  10.3 失败重试机制
+
+  当前问题：步骤失败后立即终止
+  建议：
+  // 允许部分失败，自动重试
+  if (failedSteps.size() < executionPlan.size() / 2) {  // 失败率<50%
+      // 生成重试计划，只重试失败的步骤
+      return continueNeeded=true;
+  } else {
+      return continueNeeded=false;  // 失败率过高，终止
+  }
+
+  ---
